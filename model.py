@@ -26,21 +26,88 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+
+def build_rope_cache(block_size, head_dim, base=10000):
+    """
+    Precompute RoPE cos/sin caches.
+
+    Returns:
+        cos: (1, 1, block_size, head_dim // 2)
+        sin: (1, 1, block_size, head_dim // 2)
+    """
+    assert head_dim % 2 == 0, "RoPE requires an even head dimension"
+
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, head_dim, 2).float() / head_dim)
+    )
+
+    positions = torch.arange(block_size).float()
+    freqs = torch.outer(positions, inv_freq)
+
+    cos = freqs.cos()[None, None, :, :]
+    sin = freqs.sin()[None, None, :, :]
+
+    return cos, sin
+
+
+def apply_rope(x, cos, sin):
+    """
+    Apply rotary position embedding.
+
+    x shape:
+        (B, n_head, T, head_dim)
+
+    cos/sin shape:
+        (1, 1, T, head_dim // 2)
+    """
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+
+    x_rot_even = x_even * cos - x_odd * sin
+    x_rot_odd = x_even * sin + x_odd * cos
+
+    x_out = torch.empty_like(x)
+    x_out[..., 0::2] = x_rot_even
+    x_out[..., 1::2] = x_rot_odd
+
+    return x_out
+
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
+
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.head_dim = config.n_embd // config.n_head
+        assert self.head_dim % 2 == 0, "RoPE requires head_dim to be even"
+
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        # RoPE cache
+        rope_base = getattr(config, "rope_base", 10000)
+
+        cos, sin = build_rope_cache(
+            block_size=config.block_size,
+            head_dim=self.head_dim,
+            base=rope_base,
+        )
+
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
+
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -54,9 +121,20 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+
+        # reshape into heads
+        # before: (B, T, C)
+        # after:  (B, n_head, T, head_dim)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # apply RoPE to queries and keys only
+        cos = self.rope_cos[:, :, :T, :].to(dtype=q.dtype, device=q.device)
+        sin = self.rope_sin[:, :, :T, :].to(dtype=q.dtype, device=q.device)
+
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -69,6 +147,8 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # re-assemble all head outputs side by side
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -114,6 +194,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    rope_base: int = 10000
 
 class GPT(nn.Module):
 
@@ -125,7 +206,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+#            wpe = nn.Embedding(config.block_size, config.n_embd), # add this back in if you remove the rotatry position embedding
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -155,8 +236,11 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
+
         if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+            # No learned positional embedding exists when using RoPE.
+            pass
+
         return n_params
 
     def _init_weights(self, module):
@@ -171,12 +255,21 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
-        # forward the GPT model itself
+        
+        #pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)  # add this back in if you remove the rotatry position embedding
+
+        # forward the GPT model itself # 
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        #pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)  # add this back in if you remove the rotatry position embedding
+
+        #x = self.transformer.drop(tok_emb + pos_emb) # add this back in if you remove the rotatry position embedding
+
+        x = self.transformer.drop(tok_emb)
+
+
+        
+
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -198,10 +291,21 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+
+        #self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])  # add this back in if you remove the rotatry position embedding
+
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+
+            cos, sin = build_rope_cache(
+            block_size=block_size,
+            head_dim=block.attn.head_dim,
+            base=getattr(self.config, "rope_base", 10000),
+            )
+
+            attn.rope_cos = cos.to(device=attn.rope_cos.device) # add this back in if you remove the rotatry position embedding
+            attn.rope_sin = sin.to(device=attn.rope_sin.device) # add this back in if you remove the rotatry position embedding
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
@@ -242,6 +346,7 @@ class GPT(nn.Module):
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        sd_keys_hf = [k for k in sd_keys_hf if k != 'transformer.wpe.weight']
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
